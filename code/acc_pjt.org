@@ -630,7 +630,8 @@ google earth imagery and as estimated by the map change?
 
 * Plan
 At a given location, there are three values that I'm interested in.  p
-is the true proportion of canopy cover.  p_hat_hum is the estimate of
+is the true proportion of canopy cover as seen in reference (in this
+case google earth imagery).  p_hat_hum is the estimate of
 p that is derived from human interpretation of google earth imagery
 over the location.  p_hat_map is the estimate of p derived from the
 classification of the image.
@@ -678,9 +679,95 @@ making their estimates dependent.
 Above I only used two sizes, "small" and "large", but I will probably
 test 4 or 5 sizes and do pairwise tests for significant differences.
 
+* Simulations to determine what sampling plan will be sufficient to address my hypothesis.
+
+** Consider some real location with tree cover
+#+begin_src R
+  library(sp)
+  library(foreach)
+  library(rgeos)
+  library(ggplot2)
+  library(dplyr)
+
+  x.min = 0
+  x.max = 100
+  y.min = 0
+  y.max = 100
+  stem.density = .02 # average number of stems per unit area
+  mean.crown.dia = 5
+                                          # generate derived variables
+  region_area <- (x.max-x.min)*(y.max-y.min)
 
 
+                                          # generate number of stems
 
+  n.stems <- rpois(n = 1, lambda = region_area * stem.density)
+
+
+                                          # generate locations of stems
+
+  x <- runif(n = n.stems, min = x.min, max = x.max)
+  y <- runif(n = n.stems, min = y.min, max = y.max)
+
+
+                                          # make strems sp object
+  xy <- data.frame(x,y)
+  xy.sp <- SpatialPoints(xy)
+  plot(xy.sp)
+
+
+                                          # add crown to stems
+
+  xy.pol <- foreach(i = 1:length(xy.sp)) %do% {
+                                          # https://stat.ethz.ch/pipermail/r-help/2005-May/070678.html
+      U <- runif(1)
+      t <- -log(1- U*(1-exp(-mean.crown.dia)))
+      T1<-(mean.crown.dia - t)
+      wid <- rpois(n = 1, lambda = T1)+1
+
+      pol <- gBuffer(xy.sp[i,], width = wid)
+      pol <- spChFIDs(pol, x = as.character(i))
+  }
+
+  pol <- do.call("rbind", xy.pol)
+  plot(pol)
+
+
+                                          # create tree spatial polygon
+
+  tree.sp <- gUnionCascaded(pol)
+  plot(tree.sp)
+
+  tree.sp.fort <- fortify(tree.sp) %>%
+      rename(x = long, y = lat)
+
+  ggplot() + geom_polygon(data = tree.sp.fort[tree.sp.fort$id %in% tree.sp.fort[tree.sp.fort$hole,]$id,],fill = "#7fc97f", aes(group = group, x = x, y = y))
+
+#+end_src
+
+** Consider what that real location might look like in NAIP
+NAIP has pretty good horizontal accuracy.  I think around 95 or 98% of
+reference points are less than 6m from point in image.  And in 08 or
+09 imagery from Indiana, the mean horizontal error is around 2 m.
+This is what I see in the NAIP imagery over madison, pretty small
+errors.
+
+This misregistration error is lower bound by zero, and has mean of 2 and
+95 quantile of 6.  This suggests it may be distributed lognormal.
+
+#+begin_src R
+mean <- 2
+mu <- log(2)
+
+sd <- (log(6) - mu) / qnorm(.95)
+sd
+
+exp(mu + sd^2/2)
+#+end_src
+
+#+RESULTS:
+: [1] 0.6679088
+: [1] 2.499769
 
 
 
