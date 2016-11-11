@@ -1,0 +1,686 @@
+#+TITLE:Accuracy and Spatial Scale
+#+AUTHOR: Tedward Erker
+#+email: erker@wisc.edu
+#+PROPERTY: header-args:R :session *R* :cache no :results output :exports both :tangle yes
+#+LATEX_HEADER: \usepackage[margin=0.5in]{geometry}
+#+OPTIONS: reveal_center:t reveal_progress:t reveal_history:nil reveal_control:t
+#+OPTIONS: reveal_mathjax:t reveal_rolling_links:t reveal_keyboard:t reveal_overview:t num:nil
+#+OPTIONS: reveal_width:1200 reveal_height:850
+#+OPTIONS: toc:nil
+#+REVEAL_TRANS:fade
+#+REVEAL_MARGIN: 0.01
+#+REVEAL_MIN_SCALE: 0.5
+#+REVEAL_MAX_SCALE: 2.5
+#+REVEAL_THEME: solarized
+#+REVEAL_HEAD_PREAMBLE: <meta name="description" content="Data visualization.">
+#+REVEAL_POSTAMBLE: <p> Created by Erker </p>
+#+PROPERTY: session *R*
+#+PROPERTY: cache yes
+#+PROPERTY: exports both
+#+PROPERTY: tangle yes
+
+------------
+* Pre [2016-11-11 Fri]
+** DONE make smaller spaces shapefile and send to Andy and Grady <2016-04-12 Tue>
+** load libraries
+#+BEGIN_SRC R :exports none :results none
+  library(doParallel)
+  library(gridExtra)
+    library(maptools)
+    library(spatstat)
+    library(sp)
+    library(rgeos)
+    library(foreach)
+    library(doParallel)
+  library(ascii)
+  library(broom)
+  library(plyr)
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+  library(ggplot2)
+  options(asciiType = "org")
+  org.ascii <- function(x) {
+    suppressWarnings(ascii(x))
+  }
+#+END_SRC
+
+** Motivation:
+
+Due to misregistration in high resolution images, pixel-wise accuracy
+may be low.  But at the larger scales at which endusers will perform
+analysis and make decisions, accuracy may be higher.
+
+#+BEGIN_SRC R :exports results :results graphics :file ../Pjt_acc/figs/f8.png :eval no
+  mean.crown.dia <- 20
+  n.stems <- 3
+  x <- runif(n = n.stems, min = x.min, max = x.max)
+  y <- runif(n = n.stems, min = y.min, max = y.max)
+
+                                            # make strems sp object
+        xy <- data.frame(x,y)
+        xy.sp <- SpatialPoints(xy)
+      plot(xy.sp)
+
+
+                                            # add crown to stems
+            pol <- gBuffer(xy.sp, width = mean.crown.dia)
+            pol <- spChFIDs(pol, x = as.character(i))
+
+           plot(pol)
+
+
+                                            # create tree spatial polygon
+
+        tree.sp <- gUnionCascaded(pol)
+        plot(tree.sp)
+
+# misregistered tree
+
+  x.mis <- x + rnorm(n = n.stems, sd = 6)
+  y.mis <- y + rnorm(n = n.stems, sd = 6)
+
+  xy <- data.frame(x.mis,y.mis)
+        xy.sp <- SpatialPoints(xy)
+
+                                            # add crown to stems
+            pol <- gBuffer(xy.sp, width = mean.crown.dia)
+            pol <- spChFIDs(pol, x = as.character(i))
+
+                                            # create tree spatial polygon
+
+        tree.sp.misregistered <- gUnionCascaded(pol)
+        plot(tree.sp.misregistered)
+
+  tree.sp.fort <- fortify(tree.sp) %>% rename(x = long, y = lat)
+  tree.sp.mis.fort <- fortify(tree.sp.misregistered) %>% rename(x = long, y = lat)
+
+  tree <- ggplot() +
+      geom_polygon(data = tree.sp.fort, aes(x = x, y = y, group = group), fill = "#7fc97f") +
+      coord_equal()
+
+  tree.mis <- ggplot() +
+      geom_polygon(data = tree.sp.mis.fort, aes(x = x, y = y, group = group), fill = "#7fc97f") +
+      coord_equal()
+
+  grid.arrange(tree,tree.mis, ncol = 2)
+#+END_SRC
+
+#+RESULTS:
+[[file:../Pjt_acc/figs/f8.png]]
+
+
+** Questions:
+
+1) How does the accuracy of a classified image change as spatial scale at which accuracy is assessed increases?
+
+2) Can I develop a method to report accuracies at different scales?
+
+
+** If starting from scratch:
+
+1) Select ~30 regions at each of the spatial scales of interest randomly across map.
+2) Drop X number of points randomly within each region and identify
+   their class (from google earth).  Calculate the % cover for each class.
+3) Calculate the % cover for each region using the classified image
+4) Calculate the difference in % Cover as estimated from google earth
+   and from the classified image
+5) Fit model with region size a predictor and error as response to
+   test for effect and report how error changes with spatial scale
+
+
+** However, what I'm working with now is different
+
+What I've done up to now is lazier.  The shortcuts have their
+benefits, but I need to make sure I account for possible bias or
+dependence.
+
+*** What I did:
+
+1) Drop 60 grids of points randomly on the image.
+   1) Grids range from 50mx50m to 200mx200m
+   2) distance between points is about 7m
+2) Identify the cover class below each point in google earth
+3) Starting in the north-west corner of the grids, subset the points
+   into smaller grids (2x2 - 4 points, 3x3 - 9 points, 4x4 - 16 points, etc.)
+4) Calculate percent cover from these subsets of points
+5) Calculate the percent cover from the classified image in the region
+   below these points (the square region formed by points with a 3.5m buffer)
+6) Find the difference in percent cover estimates
+7) See how the difference in percent cover estimates changes as the
+   size of the grid increases.
+
+The estimate of percent cover from google earth should probably be a
+95% CI.
+
+
+** Simulate process of using grid of points to estimate cover
+*** Define Function "test.grid.estimation.accuracy"
+#+BEGIN_SRC R
+  test.grid.estimation.accuracy <- function(stem.density,
+           mean.crown.dia,
+           x.min,
+           x.max,
+           y.min,
+           y.max,
+           dist.bw.pts,
+           n.row.col.sub = c(2,4,6,8,10,12),
+           plot = T) {
+
+                                          # generate derived variables
+      region_area <- (x.max-x.min)*(y.max-y.min)
+      n.row.col.pts <- ((x.max-x.min)/dist.bw.pts) - 1
+
+
+
+                                          # generate number of stems
+
+      n.stems <- rpois(n = 1, lambda = region_area * stem.density)
+
+
+                                          # generate locations of stems
+
+      x <- runif(n = n.stems, min = x.min, max = x.max)
+      y <- runif(n = n.stems, min = y.min, max = y.max)
+
+
+                                          # make strems sp object
+      xy <- data.frame(x,y)
+      xy.sp <- SpatialPoints(xy)
+  #    plot(xy.sp)
+
+
+                                          # add crown to stems
+
+      xy.pol <- foreach(i = 1:length(xy.sp)) %do% {
+         # https://stat.ethz.ch/pipermail/r-help/2005-May/070678.html
+          U <- runif(1)
+          t <- -log(1- U*(1-exp(-mean.crown.dia)))
+          T1<-(mean.crown.dia - t)
+          wid <- rpois(n = 1, lambda = T1)+1
+
+          pol <- gBuffer(xy.sp[i,], width = wid)
+          pol <- spChFIDs(pol, x = as.character(i))
+      }
+
+      pol <- do.call("rbind", xy.pol)
+   #   plot(pol)
+
+
+                                          # create tree spatial polygon
+
+      tree.sp <- gUnionCascaded(pol)
+    #  plot(tree.sp)
+
+                                          # these aren't technically unique, maybe need to think about how to actually make it unique
+                                          # because there is a very small chance, but a chance, that two tree realizations could have same ID
+
+   # unique id for this realization of tree cover
+  tree.sp.id <- paste0(round(runif(1,0,10000)), gArea(tree.sp)) %>% as.numeric()
+
+                                          # create grid of points
+
+      points <- expand.grid(x = dist.bw.pts * 1:n.row.col.pts, y = dist.bw.pts * 1:n.row.col.pts) %>%
+          data.frame()
+
+      points.sp <- SpatialPoints(points)
+
+                                          # For each subset of the grid, calculate covers
+
+      res <- foreach(n.row.col.subset = n.row.col.sub, .combine = "rbind") %do% {
+          min.max <- c(dist.bw.pts/2, (n.row.col.subset * dist.bw.pts) + .5*dist.bw.pts)
+          box <- expand.grid(x = min.max, y = min.max)
+          box <- box[chull(box),]
+
+          box.p <- Polygon(box)
+          box.ps <- Polygons(list(box.p),1)
+          box.sp <- SpatialPolygons(list(box.ps))
+                                          #plot(box.sp)
+
+          area.box <- gArea(box.sp)
+          tree.in.box <- gIntersection(box.sp, tree.sp)
+          if(!is.null(tree.in.box)) {
+              area.tree.in.box <- gArea(tree.in.box)
+          } else {
+              area.tree.in.box <- 0
+          }
+
+          true.cover.in.box <- area.tree.in.box / area.box
+
+          if(!is.null(tree.in.box)) {
+              n.points.in.tree.in.box <- length(gIntersection(points.sp, tree.in.box))
+          } else {
+
+              n.points.in.tree.in.box <- 0
+          }
+
+
+          n.points <- n.row.col.subset^2
+
+          estimated.cover.from.points <- n.points.in.tree.in.box / n.points
+
+
+          out <- c(n.points = n.points,
+                   box.area = area.box,
+                   stem.density = stem.density,
+                   mean.crown.dia = mean.crown.dia,
+                   true.cover.in.box = true.cover.in.box,
+            estimated.cover.from.points = estimated.cover.from.points,
+           tree.realization.id = tree.sp.id)
+
+
+# Plot
+
+          if(plot == T) {
+              tree.sp.fort <- fortify(tree.sp) %>%
+                  rename(x = long, y = lat)
+
+              box.sp.fort <- fortify(box.sp) %>%
+                  rename(x = long, y = lat)
+
+
+              rounded.true.cover <- round(true.cover.in.box,3)
+              rounded.est.cover <-  round(estimated.cover.from.points,3)
+
+              png(paste0("../Pjt_acc/figs/sims/",stem.density,"_",tree.sp.id,"_",str_pad(area.box, 5, pad = "0"),".png"))
+              p <- ggplot(data = tree.sp.fort, aes(x = x, y = y)) +
+                  geom_polygon(data = tree.sp.fort[tree.sp.fort$id %in% tree.sp.fort[tree.sp.fort$hole,]$id,],fill = "#7fc97f", aes(group = group)) +
+                  geom_polygon(data = tree.sp.fort[!tree.sp.fort$id %in% tree.sp.fort[tree.sp.fort$hole,]$id,],fill = "#7fc97f", aes(group = group)) +
+                  coord_equal() +
+                  coord_cartesian(ylim=c(-10, 110), xlim = c(-10,110)) +
+                  geom_point(data = points, aes(x = x, y = y)) +
+                  geom_polygon(data = box, aes(x = x, y = y), alpha = .3, fill = "#beaed4") +
+                  geom_path(data = box.sp.fort, color = "black") +
+                  theme_bw() +
+                  annotate("text",
+                           label = paste0("True Cover in Box: ",rounded.true.cover, "\n",
+                                          "Estimated Cover by points: ",rounded.est.cover),
+                           x = mean(c(x.min,x.max)), y = y.max, size = 8, colour = "#f0027f") +
+                  annotate("text",
+                           label = paste0("deviation: ", round(rounded.true.cover - rounded.est.cover,3)),
+                           x = mean(c(x.min,x.max)), y = y.min, size = 8, colour = "#f0027f")
+              print(p)
+              dev.off()
+          }
+          out
+      }
+
+      res <- data.frame(res)
+
+  return(res)
+  }
+#+END_SRC
+
+#+RESULTS:
+
+*** test grid estimation
+#+BEGIN_SRC R :eval no
+    x.min <- 0
+    x.max <- 100
+    y.min <- 0
+    y.max <- 100
+
+    dist.bw.pts <- 7
+
+
+                                            # Simple test run of function
+
+    ## test.grid.estimation.accuracy(stem.density = stem.density,
+    ##                               mean.crown.dia = mean.crown.dia,
+    ##                               x.min = x.min,
+    ##                               x.max = x.max,
+    ##                               y.min = y.min,
+    ##                               y.max = y.max,
+    ##                               dist.bw.pts = dist.bw.pts)
+
+
+    out.df <- foreach(stem.den = c(.001,.003,.005,.007,.009,.011, .013), .combine = "rbind") %do% {
+        foreach(mean.crown.dia = c(5), .combine = "rbind") %do% {
+                rep <- replicate(n = 100, test.grid.estimation.accuracy(stem.density = stem.den,
+                                  mean.crown.dia = mean.crown.dia,
+                                  x.min = x.min,
+                                  x.max = x.max,
+                                  y.min = y.min,
+                                  y.max = y.max,
+                                  dist.bw.pts = dist.bw.pts,
+                                  plot = F),
+                                 simplify = F)
+                out <- bind_rows(rep)
+                return(out)
+            }
+        }
+
+    out.df <- out.df %>%
+        mutate(error = true.cover.in.box - estimated.cover.from.points)
+
+  saveRDS(out.df, file = "../Pjt_acc/out.rds")
+
+#+END_SRC
+
+#+RESULTS[8f86489e2c118d85341be360fd9864bc7cc6f986]:
+
+#+BEGIN_SRC R :eval no
+out.df <- readRDS("../Pjt_acc/out.rds")
+#+END_SRC
+
+** Plots
+
+#+BEGIN_SRC R :results raw :eval no
+
+  figs <- list.files(path = "../Pjt_acc/figs/sims/",  full.names = T)
+
+  figs <- figs[1:50]
+
+  out <- sapply(figs, function(fig) message("** [[file:", fig, "]]"))
+
+#+END_SRC
+
+#+RESULTS:
+*** [[file:../Pjt_acc/figs/sims//0.001_55789.2419614318_00196.png]]
+*** [[file:../Pjt_acc/figs/sims//0.001_55789.2419614318_00784.png]]
+*** [[file:../Pjt_acc/figs/sims//0.001_55789.2419614318_01764.png]]
+*** [[file:../Pjt_acc/figs/sims//0.001_55789.2419614318_03136.png]]
+*** [[file:../Pjt_acc/figs/sims//0.001_55789.2419614318_04900.png]]
+*** [[file:../Pjt_acc/figs/sims//0.001_55789.2419614318_07056.png]]
+*** [[file:../Pjt_acc/figs/sims//0.001_6899883.95146242_00196.png]]
+*** [[file:../Pjt_acc/figs/sims//0.001_6899883.95146242_00784.png]]
+*** [[file:../Pjt_acc/figs/sims//0.001_6899883.95146242_01764.png]]
+*** [[file:../Pjt_acc/figs/sims//0.001_6899883.95146242_03136.png]]
+*** [[file:../Pjt_acc/figs/sims//0.001_6899883.95146242_04900.png]]
+*** [[file:../Pjt_acc/figs/sims//0.001_6899883.95146242_07056.png]]
+*** [[file:../Pjt_acc/figs/sims//0.003_34152724.6073636_00196.png]]
+*** [[file:../Pjt_acc/figs/sims//0.003_34152724.6073636_00784.png]]
+*** [[file:../Pjt_acc/figs/sims//0.003_34152724.6073636_01764.png]]
+*** [[file:../Pjt_acc/figs/sims//0.003_34152724.6073636_03136.png]]
+*** [[file:../Pjt_acc/figs/sims//0.003_34152724.6073636_04900.png]]
+*** [[file:../Pjt_acc/figs/sims//0.003_34152724.6073636_07056.png]]
+*** [[file:../Pjt_acc/figs/sims//0.003_61402326.8657661_00196.png]]
+*** [[file:../Pjt_acc/figs/sims//0.003_61402326.8657661_00784.png]]
+*** [[file:../Pjt_acc/figs/sims//0.003_61402326.8657661_01764.png]]
+*** [[file:../Pjt_acc/figs/sims//0.003_61402326.8657661_03136.png]]
+*** [[file:../Pjt_acc/figs/sims//0.003_61402326.8657661_04900.png]]
+*** [[file:../Pjt_acc/figs/sims//0.003_61402326.8657661_07056.png]]
+*** [[file:../Pjt_acc/figs/sims//0.005_87482826.3786492_00196.png]]
+*** [[file:../Pjt_acc/figs/sims//0.005_87482826.3786492_00784.png]]
+*** [[file:../Pjt_acc/figs/sims//0.005_87482826.3786492_01764.png]]
+*** [[file:../Pjt_acc/figs/sims//0.005_87482826.3786492_03136.png]]
+*** [[file:../Pjt_acc/figs/sims//0.005_87482826.3786492_04900.png]]
+*** [[file:../Pjt_acc/figs/sims//0.005_87482826.3786492_07056.png]]
+*** [[file:../Pjt_acc/figs/sims//0.005_93393661.4760753_00196.png]]
+*** [[file:../Pjt_acc/figs/sims//0.005_93393661.4760753_00784.png]]
+*** [[file:../Pjt_acc/figs/sims//0.005_93393661.4760753_01764.png]]
+*** [[file:../Pjt_acc/figs/sims//0.005_93393661.4760753_03136.png]]
+*** [[file:../Pjt_acc/figs/sims//0.005_93393661.4760753_04900.png]]
+*** [[file:../Pjt_acc/figs/sims//0.005_93393661.4760753_07056.png]]
+*** [[file:../Pjt_acc/figs/sims//0.007_29115170.413594_00196.png]]
+*** [[file:../Pjt_acc/figs/sims//0.007_29115170.413594_00784.png]]
+*** [[file:../Pjt_acc/figs/sims//0.007_29115170.413594_01764.png]]
+*** [[file:../Pjt_acc/figs/sims//0.007_29115170.413594_03136.png]]
+*** [[file:../Pjt_acc/figs/sims//0.007_29115170.413594_04900.png]]
+*** [[file:../Pjt_acc/figs/sims//0.007_29115170.413594_07056.png]]
+*** [[file:../Pjt_acc/figs/sims//0.007_55514937.6659549_00196.png]]
+*** [[file:../Pjt_acc/figs/sims//0.007_55514937.6659549_00784.png]]
+*** [[file:../Pjt_acc/figs/sims//0.007_55514937.6659549_01764.png]]
+*** [[file:../Pjt_acc/figs/sims//0.007_55514937.6659549_03136.png]]
+*** [[file:../Pjt_acc/figs/sims//0.007_55514937.6659549_04900.png]]
+*** [[file:../Pjt_acc/figs/sims//0.007_55514937.6659549_07056.png]]
+*** [[file:../Pjt_acc/figs/sims//0.009_40556431.804912_00196.png]]
+*** [[file:../Pjt_acc/figs/sims//0.009_40556431.804912_00784.png]]
+
+
+** Other Plots
+
+#+BEGIN_SRC R :exports results :results graphics :file ../Pjt_acc/figs/f1.png
+  ggplot(out.df, aes(x = true.cover.in.box, y = error)) + geom_point() + facet_grid(~n.points)
+#+END_SRC
+
+#+RESULTS:
+[[file:../Pjt_acc/figs/f1.png]]
+
+#+BEGIN_SRC R :exports results :results graphics :file ../Pjt_acc/figs/f2.png
+  ggplot(out.df, aes(x = true.cover.in.box, y = abs(error))) + geom_point() + facet_grid(~n.points)
+
+#+END_SRC
+
+#+RESULTS:
+[[file:../Pjt_acc/figs/f2.png]]
+
+
+#+BEGIN_SRC R :exports results :results graphics :file ../Pjt_acc/figs/f3.png
+  ggplot(out.df, aes(x = true.cover.in.box, y = estimated.cover.from.points,
+                     color = stem.density)) + geom_point(alpha = .1) +
+      coord_equal() +
+      facet_wrap(~n.points)
+#+END_SRC
+
+#+RESULTS:
+[[file:../Pjt_acc/figs/f3.png]]
+
+#+BEGIN_SRC R :exports results :results graphics :file ../Pjt_acc/figs/f4.png
+  ggplot(out.df, aes(x = true.cover.in.box, y = estimated.cover.from.points)) + geom_point(alpha = .1) +
+      geom_density2d() +
+      coord_equal() +
+      facet_grid(stem.density~n.points)
+#+END_SRC
+
+#+RESULTS:
+[[file:../Pjt_acc/figs/f4.png]]
+
+The 100 realizations of the same stem density on the x axis. Shows
+that there is correlation within grids between error rates of
+different box/grid sizes.
+
+#+BEGIN_SRC R :exports results :results graphics :file ../Pjt_acc/figs/f5.png :height 2000
+  # Errors are dependent on which tree realization it is
+  ggplot(out.df, aes(x = factor(tree.realization.id), y = error)) + geom_boxplot() +
+      facet_wrap(~stem.density, ncol = 1, scales = "free")
+
+#+END_SRC
+
+#+RESULTS:
+[[file:../Pjt_acc/figs/f5.png]]
+
+
+*** To what degree does this grid sampling deviate from a standard binomial distribution?
+#+BEGIN_SRC R :exports results :results graphics :file ../Pjt_acc/figs/f6.png
+
+  binomial.df <- foreach(s = c(4,16,36,64,100,144), .combine = "rbind") %do% {
+      foreach(p = seq(0,1,.05), .combine = "rbind") %do% {
+          phat <- rbinom(n = 100, size = s, prob = p)/s
+          df <- data.frame(phat = phat, n.pts = s, prob = p)
+      }
+  } %>% data.frame
+
+  ggplot(binomial.df, aes(x = prob, y = phat)) + geom_point(alpha = .1) +
+      coord_equal() +
+      facet_grid(~n.pts)
+
+
+
+#+END_SRC
+
+#+RESULTS:
+[[file:../Pjt_acc/figs/f6.png]]
+
+
+#+BEGIN_SRC R :exports results :results graphics :file ../Pjt_acc/figs/f7.png
+
+#+END_SRC
+
+
+
+
+
+There is clear dependence in the error within a grid.
+
+ALso the grid is regular, but this is required to get the
+same number of points per unit area.
+
+For a non-spatial binomial distribution, the sample size reduces
+variance.  How might spatial extent affect the variance of the
+estimate of p?
+
+points/area is the same, but number of points is not
+
+Why square instead of another shape?
+
+
+** How well does placing the grid on a landscape estimate cover?
+How does stem density and crown width which affect true cover, affect
+the accuracy of this estimate?
+
+** Calculating VAR(p1 -p2)
+
+#+BEGIN_SRC R
+
+    n2 <- 225
+
+    out.mat <- foreach(pt = seq(.1,.9,.1), .combine = "rbind") %do% {
+       foreach(n1 = seq(4,n2, 10), .combine = "rbind") %do% {
+           samp.n <- 10000
+
+           x1 <- rbinom(n = samp.n, size = n1, p = pt)
+           p1 <- x1/n1
+
+           xd <- rbinom(n = samp.n, size = (n2-n1), p = pt)
+           p2 <- (x1+xd)/n2
+
+           vp1<-var(p1)
+           vp2<-var(p2)
+           cvp1p2<-cov(x=p1,y=p2)
+           vp2.m.vp1 = sum(c(vp1, vp2, 2* cvp1p2))
+           cor.p1.p2 <- cor(p1,p2)
+           c(true.p = pt, prop.n1.to.n2 = (n1/n2), var.phat1 = vp1, var.phat2 = vp2, cov.phat1.phat2 = cvp1p2, cor.phat1.phat2 = cor.p1.p2, var.p2.minus.p1 = vp2.m.vp1)
+       }
+    }
+
+#+END_SRC
+
+#+RESULTS:
+
+#+BEGIN_SRC R :eval no
+
+    n2 <- 100
+
+    out.mat <- foreach(pt = seq(.1,.9,.1), .combine = "rbind") %do% {
+       foreach(n1 = seq(10,n2, 10), .combine = "rbind") %do% {
+           samp.n <- 10000
+
+           x1 <- rbinom(n = samp.n, size = n1, p = pt)
+           p1 <- x1
+
+           xd <- rbinom(n = samp.n, size = (n2-n1), p = pt)
+           p2 <- (x1+xd)
+
+           vp1<-var(p1)
+           vp2<-var(p2)
+           cvp1p2<-cov(x=p1,y=p2)
+           vp2.m.vp1 = sum(c(vp1, vp2, 2* cvp1p2))
+           cor.p1.p2 <- cor(p1,p2)
+           c(true.p = pt, prop.n1.to.n2 = (n1/n2), var.phat1 = vp1, var.phat2 = vp2, cov.phat1.phat2 = cvp1p2, cor.phat1.phat2 = cor.p1.p2, var.p2.minus.p1 = vp2.m.vp1)
+       }
+    }
+
+#+END_SRC
+#+RESULTS:
+
+
+#+BEGIN_SRC R
+  out <- data.frame(out.mat)
+  out.g <- gather(out, key = var.cov, value = value, -true.p, -prop.n1.to.n2)
+  out.g %>% head()
+#+END_SRC
+
+#+RESULTS:
+#+begin_example
+Warning message:
+In data.row.names(row.names, rowsi, i) :
+  some row.names duplicated: 24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,97,98,99,100,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,121,122,123,124,125,126,127,128,129,130,131,132,133,134,135,136,137,138,139,140,141,142,143,144,145,146,147,148,149,150,151,152,153,154,155,156,157,158,159,160,161,162,163,164,165,166,167,168,169,170,171,172,173,174,175,176,177,178,179,180,181,182,183,184,185,186,187,188,189,190,191,192,193,194,195,196,197,198,199,200,201,202,203,204,205,206,207 --> row.names NOT used
+
+ true.p prop.n1.to.n2   var.cov       value
+1    0.1    0.01777778 var.phat1 0.022418036
+2    0.1    0.06222222 var.phat1 0.006430185
+3    0.1    0.10666667 var.phat1 0.003774855
+4    0.1    0.15111111 var.phat1 0.002647883
+5    0.1    0.19555556 var.phat1 0.002081085
+6    0.1    0.24000000 var.phat1 0.001689361
+#+end_example
+
+#+BEGIN_SRC R :exports results :results graphics :file ../Pjt_acc/figs/explore.pVar.png
+
+  out.g.no.cor <- filter(out.g, var.cov != "cor.phat1.phat2")
+
+  ggplot(out.g.no.cor, aes(x = prop.n1.to.n2, y = value, color = var.cov)) + geom_line() +
+  facet_wrap(~true.p)
+
+  ggplot(filter(out.g, var.cov != "var.phat1"), aes(x = prop.n1.to.n2, y = value, color = var.cov)) + geom_line() +
+  facet_wrap(~true.p)
+
+
+#+END_SRC
+
+#+RESULTS:
+[[file:../Pjt_acc/figs/explore.pVar.png]]
+
+* Objective
+We want to test how the accuracy of the map changes with spatial
+scale.  As we consider larger and larger areas, how does the agreement
+between percent canopy cover as estimated by human interpretation of
+google earth imagery and as estimated by the map change?
+
+* Plan
+At a given location, there are three values that I'm interested in.  p
+is the true proportion of canopy cover.  p_hat_hum is the estimate of
+p that is derived from human interpretation of google earth imagery
+over the location.  p_hat_map is the estimate of p derived from the
+classification of the image.
+
+p is unknown.
+
+p_hat_hum is derived from human interpretation of google earth
+imagery.  If the value is determined by hand digitizing the entire
+region, we will assume it was done perfectly and so p_hat_hum = p.
+However, because some of the areas that we will assess will be quite
+large and hand digitizing may take too much time, we will use random
+points to calculate p_hat_hum.  For example, if the area that we want
+to calculate accuracy at is 100 m^2, we'll place n points randomly in
+this area and determine the cover below them.  Using the normal
+approximation, the variance for p_hat_hum is
+(p_hat_hum*(1-p_hat_hum)/n).  Which is at most .25/n.
+
+p_hat_map is derived from the classified imagery.  Given the area of
+interested, p_hat_map is the proportion of pixels in that area
+classified as tree canopy cover.
+
+* Hypothesis
+
+Does the difference between p and p_hat_map (that is the error of the
+map), decrease as the area under consideration increases?
+
+Substitute p_hat_hum for p, since we don't know it, and write in
+symbols.
+
+H_o: (p_hat_map_small - p_hat_hum_small) > (p_hat_map_large - p_hat_hum_large)
+H_a: (p_hat_map_small - p_hat_hum_small) !> (p_hat_map_large - p_hat_hum_large)
+
+or
+
+H_o: (p_hat_map_small - p_hat_hum_small) - (p_hat_map_large -
+p_hat_hum_large) > 0
+H_a: (p_hat_map_small - p_hat_hum_small) - (p_hat_map_large -
+p_hat_hum_large) !> 0
+
+where p_hat_map_small is the mean p_hat_map over m locations of size
+"small", and p_hat_map_large is the mean p_hat_map over m locations of
+size "large".  Each small region is nested within a large region,
+making their estimates dependent.
+
+Above I only used two sizes, "small" and "large", but I will probably
+test 4 or 5 sizes and do pairwise tests for significant differences.
+
+
+
+
+
+
+
