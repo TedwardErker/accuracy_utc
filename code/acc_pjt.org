@@ -693,7 +693,7 @@ test 4 or 5 sizes and do pairwise tests for significant differences.
   x.max = 100
   y.min = 0
   y.max = 100
-  stem.density = .02 # average number of stems per unit area
+  stem.density = .01 # average number of stems per unit area
   mean.crown.dia = 5
                                           # generate derived variables
   region_area <- (x.max-x.min)*(y.max-y.min)
@@ -717,21 +717,20 @@ test 4 or 5 sizes and do pairwise tests for significant differences.
 
 
                                           # add crown to stems
-
+  diameters <- vector(length = length(xy.sp)) #vector to save diameters of trees created
   xy.pol <- foreach(i = 1:length(xy.sp)) %do% {
                                           # https://stat.ethz.ch/pipermail/r-help/2005-May/070678.html
       U <- runif(1)
       t <- -log(1- U*(1-exp(-mean.crown.dia)))
       T1<-(mean.crown.dia - t)
-      wid <- rpois(n = 1, lambda = T1)+1
-
-      pol <- gBuffer(xy.sp[i,], width = wid)
+      dia <- rpois(n = 1, lambda = T1)+1
+      diameters[i] <- dia
+      pol <- gBuffer(xy.sp[i,], width = dia)
       pol <- spChFIDs(pol, x = as.character(i))
   }
 
   pol <- do.call("rbind", xy.pol)
   plot(pol)
-
 
                                           # create tree spatial polygon
 
@@ -745,6 +744,8 @@ test 4 or 5 sizes and do pairwise tests for significant differences.
 
 #+end_src
 
+#+RESULTS:
+
 ** Consider what that real location might look like in NAIP
 NAIP has pretty good horizontal accuracy.  I think around 95 or 98% of
 reference points are less than 6m from point in image.  And in 08 or
@@ -753,21 +754,255 @@ This is what I see in the NAIP imagery over madison, pretty small
 errors.
 
 This misregistration error is lower bound by zero, and has mean of 2 and
-95 quantile of 6.  This suggests it may be distributed lognormal.
+95 quantile of 6.  Maybe it has an exponential distribution?  I tried
+looking up data on the accuracy assessment of NAIP imagery, but
+couldn't find anything on the distribution of error or the raw data.
 
 #+begin_src R
 mean <- 2
-mu <- log(2)
-
-sd <- (log(6) - mu) / qnorm(.95)
-sd
-
-exp(mu + sd^2/2)
+lambda <- 1/mean
+qexp(p = .95, rate = lambda, lower.tail = T)
 #+end_src
 
 #+RESULTS:
-: [1] 0.6679088
-: [1] 2.499769
+: [1] 5.991465
+
+The 95% quantile of an exponential distribution with mean 2 is
+about 6. It seems like the exponential distribution may work well
+enough for the horizontal shift in a scene.
+
+*** Shift canopy cover by a distance D ~ Exp( \lambda = 1/2)
+#+begin_src R
+  d <- rexp(n = 1, rate = .5)
+  direction.radian <- runif(n = 1, min = 0, max = 2*pi)
+  x.shift <- d * cos(direction.radian)
+  y.shift <- d * sin(direction.radian)
+
+  x <- coordinates(xy.sp)[,1] + x.shift
+  y <- coordinates(xy.sp)[,2] + y.shift
+
+  xy.sp.hshift <- SpatialPoints(cbind(x,y))
+
+#+end_src
+
+#+RESULTS:
+
+*** "Leaning Tree"  Parallax issues
+Objects with height are shifted in the imagery away from the center of
+the image.  NAIP is orthorectified with a digital elevation model and
+I think in the direction of the plane's flight, but there isn't
+sufficient overlap to create true orthophotos - hence this leaning
+tree problem.  Flights were generally north-south, so trees are
+shifted in the image towards the east or west.  The amount of shift
+depends on the height of the tree and the distance from the center of
+the image.  I'm not sure what the distribution of the shifts will be.
+
+elevation = 9000 m is the altitude of plane collecting imagery
+field of view is 64 degrees
+dist.to.center = distance to point on ground nadir to plane (center of
+image)
+h = height of object on ground
+d = distance the top of that object will be shifted in the image
+relative to its true location
+
+elevation/dist.to.center = height/d
+
+d =  height / (elevation/dist.to.center)
+
+#+begin_src R
+
+  num <- length(xy.sp.hshift)
+    east.west <- sample(c(1,-1), size = 1, replace = T)
+    dist.to.center <- runif(0,6000, n = 1) #width of flightline is about 12km
+
+    lean <- function(east.west, height, dist.to.center) {
+        d = height / (9000/dist.to.center)
+        d <- d*east.west
+        return(d)
+    }
+
+  lean.dist <- lean(east.west, diameters, dist.to.center)
+
+x <- x + lean.dist
+
+xy.sp.leanshift <- SpatialPoints(cbind(x,y))
+plot(xy.sp.leanshift)
+
+#+end_src
+
+#+RESULTS:
+
+#+begin_src R
+    xy.pol <- foreach(i = 1:length(xy.sp.leanshift)) %do% {
+      pol <- gBuffer(xy.sp.leanshift[i,], width = diameters[i])
+      pol <- spChFIDs(pol, x = as.character(i))
+    }
+
+    pol.shift <- do.call("rbind", xy.pol)
+    plot(pol.shift)
+
+    tree.sp.shift <- gUnionCascaded(pol.shift)
+    plot(tree.sp.shift)
+
+    tree.sp.fort.shift <- fortify(tree.sp.shift) %>%
+        rename(x = long, y = lat)
+
+  true.tree <-  geom_polygon(data = tree.sp.fort[tree.sp.fort$id %in% tree.sp.fort[tree.sp.fort$hole,]$id,],fill = NA, color = "#33a02c", aes(group = group, x = x, y = y))
+
+    p1 <- ggplot() +
+        theme_bw() +
+      true.tree
+
+    p1
+
+    p2 <- p1 +
+        geom_polygon(data = tree.sp.fort.shift[tree.sp.fort.shift$id %in% tree.sp.fort.shift[tree.sp.fort.shift$hole,]$id,],fill = "#b2df8a", aes(group = group, x = x, y = y), size = 3)
+
+    p2
+
+
+#+end_src
+
+#+RESULTS:
+:  Error in rename(., x = long, y = lat) : unused argument (y = lat)
+
+** Rasterize what NAIP images
+#+begin_src R
+
+      library(raster)
+    library(plyr)
+      r <- raster(extent(bbox(tree.sp.shift)),nrows = 100, ncols = 100)
+      values(r) <- 0
+
+      tree.r.shift <- rasterize(tree.sp.shift, r)
+      plot(tree.r.shift)
+      tree.r.shift.df <- as.data.frame(tree.r.shift, xy=T)
+
+
+  r.plot <- ggplot(tree.r.shift.df, aes(x = x, y = y, fill = layer))  + geom_raster() + theme_bw() +
+      scale_fill_continuous(high = "green", na.value = "white")
+
+  r.plot
+
+  r.plot + true.tree
+#+End_src
+
+#+RESULTS:
+
+** Create a pseudoclassifier that has a certain amount of error built in.
+
+greater error at boundaries
+
+#+begin_src R
+
+  bound <- boundaries(tree.r.shift)
+
+  tree.r.shift[is.na(tree.r.shift)] <- 0
+
+  tree <- stack(tree.r.shift, bound)
+
+  rand <- runif(ncell(tree))
+
+  interior.error.rate <- .10
+  additional.boundary.error.rate <- .15
+
+
+  atree.r.shift <- tree.r.shift - interior.error.rate
+  bound[bound == 1] <- additional.boundary.error.rate
+
+  btree.r.shift <- atree.r.shift - bound
+
+  rand.raster <- raster(btree.r.shift)
+  values(rand.raster) <- runif(ncell(rand.raster))
+
+  classified.tree <- overlay(btree.r.shift, rand.raster, fun=function(x,y){ifelse(x>y, T,F)})
+  plot(classified.tree)
+
+
+  classified.tree.df <- as.data.frame(classified.tree, xy = T)
+
+  ggplot(classified.tree.df, aes(x = x, y = y, fill = layer)) + geom_raster()
+
+#+end_src
+** Create Accuracy Assessment points
+
+1) Single points (really 1m^2 boxes)
+2) circles of increasing radii with n randomly located points in them
+3) squares of increasing size with n randomly located points in them
+
+#+begin_src R
+
+  pt <- SpatialPoints(matrix(c(50,50),nrow = 1))
+
+  pt.cir <- gBuffer(pt,width = .5, quadsegs = 5)
+
+  plot(pt.cir)
+
+#+end_src
+
+#+begin_src R
+  spsample.exact <- function(x, exact.n, type, ...) {
+      exact.n <- round(exact.n)
+      sp <- spsample(x, n = exact.n, type)
+      while (length(sp) != exact.n) {
+          sp <- spsample(x, n = exact.n, type)
+      }
+      return(sp)
+  }
+
+
+  AddHoleToPolygon <-function(poly,hole){
+      # invert the coordinates for Polygons to flag it as a hole
+      coordsHole <-  hole@polygons[[1]]@Polygons[[1]]@coords
+      newHole <- Polygon(coordsHole,hole=TRUE)
+
+      # punch the hole in the main poly
+      listPol <- poly@polygons[[1]]@Polygons
+      listPol[[length(listPol)+1]] <- newHole
+      punch <- Polygons(listPol,poly@polygons[[1]]@ID)
+
+      # make the polygon a SpatialPolygonsDataFrame as the entry
+      new <- SpatialPolygons(list(punch),proj4string=poly@proj4string)
+      new <- SpatialPolygonsDataFrame(new,data=as(poly,"data.frame"))
+
+      return(new)
+  }
+
+  small.radius <- 10
+  large.radius <- 20
+  largest.radius <- 30
+  n <- 100
+  sampling.type = "random"
+
+  radii <- c(10,20,30) # must be increasing
+
+  circles <- lapply(radii, function(radius) as(gBuffer(pt, width = radius), "SpatialPolygonsDataFrame"))
+
+
+  pts.list <- list()
+
+  for(i in 1:length(radii)) {
+      if(i == 1) {
+          pts <- spsample.exact(circles[[i]], exact.n = n, type = sampling.type)
+      }
+      if (i > 1) {
+          area.ratio.small.large <- gArea(circles[[i-1]])/gArea(circles[[i]])
+          ring <- AddHoleToPolygon(circles[[i]],circles[[i-1]])
+          pts.sub <- sample(pts.list[[i-1]], size = n*area.ratio.small.large)
+          pts.add <- spsample.exact(ring, exact.n = n*(1-area.ratio.small.large), type = sampling.type)
+          pts <- bind(pts.add, pts.sub)
+      }
+          pts.list[[i]] <- pts
+  }
+
+
+
+
+#+end_src
+
+#+RESULTS:
+: Error in sample.Spatial(as(x, "Spatial"), n_tot * (1 + its * 0.1), type = type,  :
+:   sampling type Regular not recognized
 
 
 
