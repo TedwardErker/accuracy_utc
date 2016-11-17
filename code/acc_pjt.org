@@ -1,7 +1,7 @@
 #+TITLE:Accuracy and Spatial Scale
 #+AUTHOR: Tedward Erker
 #+email: erker@wisc.edu
-#+PROPERTY: header-args:R :session *R* :cache no :results output :exports both :tangle yes
+#+PROPERTY: header-args:R :cache no :results output :exports both :tangle yes :session *R*
 #+LATEX_HEADER: \usepackage[margin=0.5in]{geometry}
 #+OPTIONS: reveal_center:t reveal_progress:t reveal_history:nil reveal_control:t
 #+OPTIONS: reveal_mathjax:t reveal_rolling_links:t reveal_keyboard:t reveal_overview:t num:nil
@@ -20,6 +20,9 @@
 #+PROPERTY: tangle yes
 
 ------------
+* COMMENT to run on krusty
+set R directory to
+/ssh:krusty:~/accuracy_utc/code/
 * Pre [2016-11-11 Fri]
 ** DONE make smaller spaces shapefile and send to Andy and Grady <2016-04-12 Tue>
 ** load libraries
@@ -680,199 +683,7 @@ Above I only used two sizes, "small" and "large", but I will probably
 test 4 or 5 sizes and do pairwise tests for significant differences.
 
 * Simulations to determine what sampling plan will be sufficient to address my hypothesis.
-
-** functions
-#+begin_src R
-  fortifyMerge = function(shapes.sp, col="id") {
-      shapes.sp@data[,col] = rownames(shapes.sp@data)
-      shapes.df = fortify(shapes.sp)
-      shapes.df = merge(shapes.df, shapes.sp@data, by=col, all.x=TRUE)
-      return(shapes.df)
-  }
-
-  make.true.tree.cover.realization <- function(stem.density,
-                                               mean.crown.dia) {
-
-      x.min = 0
-      x.max = 100
-      y.min = 0
-      y.max = 100
-
-                                          # generate derived variables
-      region_area <- (x.max-x.min)*(y.max-y.min)
-
-                                          # generate number of stems
-      n.stems <- rpois(n = 1, lambda = region_area * stem.density)
-
-                                          # generate locations of stems
-      x <- runif(n = n.stems, min = x.min, max = x.max)
-      y <- runif(n = n.stems, min = y.min, max = y.max)
-
-                                          # make stems sp object
-      xy <- data.frame(x,y)
-      xy.sp <- SpatialPoints(xy)
-
-      diameters <- vector(length = length(xy.sp)) #vector to save diameters of trees created
-      xy.pol <- foreach(i = 1:length(xy.sp)) %do% {
-                                          # https://stat.ethz.ch/pipermail/r-help/2005-May/070678.html
-          U <- runif(1)
-          t <- -log(1- U*(1-exp(-mean.crown.dia)))
-          T1<-(mean.crown.dia - t)
-          dia <- rpois(n = 1, lambda = T1)+1
-          diameters[i] <- dia
-          pol <- gBuffer(xy.sp[i,], width = dia)
-          pol <- spChFIDs(pol, x = as.character(i))
-      }
-
-      pol <- do.call("rbind", xy.pol)
-
-      tree.sp <- gUnionCascaded(pol)
-
-      out.list <- list(tree.cover.sp = tree.sp, diameters = diameters, pt.sp = xy.sp)
-      return(out.list)
-  }
-
-  make.pseudo.classification <- function(pts,
-                                         diameters,
-                                         h_shift = T,
-                                         horizontal_shift_mean = 2,
-                                         lean = T,
-                                         interior.error.rate = .05,
-                                         additional.boundary.error.rate = .15) {
-
-      if(h_shift == T) {
-                                          # draw horizontal shift from exponential distribution with mean horizontal_shift_mean
-          lambda = 1/horizontal_shift_mean
-          d <- rexp(n = 1, rate = lambda)
-          direction.radian <- runif(n = 1, min = 0, max = 2*pi)
-          x.shift <- d * cos(direction.radian)
-          y.shift <- d * sin(direction.radian)
-
-          x <- coordinates(pts)[,1] + x.shift
-          y <- coordinates(pts)[,2] + y.shift
-
-          pts <- SpatialPoints(cbind(x,y))
-      }
-
-                                          # Assign lean based on random draw from uniform distribution to determine east/west, and distance from image center
-      if(lean == T) {
-          num <- length(pts)
-          east.west <- sample(c(1,-1), size = 1, replace = T)
-          dist.to.center <- runif(0,6000, n = 1) #width of flightline is about 12km
-
-          lean <- function(east.west, height, dist.to.center) {
-              d = height / (9000/dist.to.center)
-              d <- d*east.west
-              return(d)
-          }
-
-          lean.dist <- lean(east.west, diameters, dist.to.center)
-
-          x <-  coordinates(pts)[,1] + lean.dist
-          y <- coordinates(pts)[,2]
-
-          pts <- SpatialPoints(cbind(x,y))
-      }
-
-      xy.pol <- foreach(i = 1:length(pts)) %do% {
-          pol <- gBuffer(pts[i,], width = diameters[i])
-          pol <- spChFIDs(pol, x = as.character(i))
-      }
-
-      pol <- do.call("rbind", xy.pol)
-
-      tree.sp <- gUnionCascaded(pol)
-
-                                          # rasterize polygon to NAIP imagery resolution
-      r <- raster(extent(bbox(tree.sp)),nrows = 100, ncols = 100)
-      values(r) <- 0
-
-      tree.r <- rasterize(tree.sp, r)
-
-                                          # "classify" image with overall error, and additional error at boundaries of tree cover
-      bound <- boundaries(tree.r, classes = T)
-
-      tree <- tree.r
-
-      tree[is.na(tree)] <- -1
-
-      rand <- runif(ncell(tree))
-
-      rand.raster <- raster(tree)
-      values(rand.raster) <- runif(ncell(rand.raster))
-
-      acc.raster <- raster(tree)
-      values(acc.raster) <- 1
-      acc.raster[bound == 1] <- acc.raster[bound == 1] - additional.boundary.error.rate
-      acc.raster <- acc.raster - interior.error.rate
-
-      acc.raster <- acc.raster > rand.raster
-
-      classified.tree <- overlay(tree, acc.raster, fun=function(x,y){ifelse(y==T, x*1,x*-1)})
-
-      out <- list(classified.cover = classified.tree, tree.raster = tree.r, points = pts)
-      return(out)
-  }
-
-
-make.class.trueCover.agreement.df <- function(replicate,
-                                              stem.density = .01,
-                                              mean.crown.dia = 5,
-                                              h_shift_mean = 2,
-                                              interior.error.rate = .05,
-                                              additional.boundary.error.rate = .15) {
-
-
-    true.tree.cover.realization <- make.true.tree.cover.realization(stem.density,
-                                                                    mean.crown.dia)
-
-pseudo.classification <- make.pseudo.classification(true.tree.cover.realization$pt.sp,
-                                                    true.tree.cover.realization$diameters,
-                                                    h_shift = T,
-                                                    horizontal_shift_mean = h_shift_mean,
-                                                    lean = T,
-                                                    interior.error.rate,
-                                                    additional.boundary.error.rate)
-
-
-pt <- SpatialPoints(matrix(c(50,50),nrow = 1))
-radii <- seq(1,50,3)
-
-circles <- lapply(radii, function(radius) as(gBuffer(pt, width = radius), "SpatialPolygonsDataFrame")) %>%
-    unlist()
-
-pct.tree.classification <- lapply(circles, function(circle) {
-    values <- extract(pseudo.classification$classified.cover, circle) %>% unlist()
-    pct.tree.classification <- sum(values == 1)/length(values)
-    pct.tree.classification
-}
-) %>%
-    unlist()
-
-pct.tree.true <- lapply(circles, function(circle) {
-    pct.tree.true <- gArea(crop(true.tree.cover.realization$tree.cover.sp, circle))/gArea(circle)
-}) %>%
-    unlist()
-
-agreement.df <- data.frame(pct.tree.true = pct.tree.true,
-                           pct.tree.classification = pct.tree.classification,
-                           error = abs(pct.tree.true - pct.tree.classification),
-                           radius = radii,
-                           area = round(radii^2*pi),
-                           horizontal_shift_mean = h_shift_mean,
-                           interior.error.rate = interior.error.rate,
-                           additional.boundary.error.rate = additional.boundary.error.rate,
-                           replicate = replicate
-                           )
-return(list(agreement.df, true.tree.cover.realization, pseudo.classification))
-}
-
-
-#+end_src
-
-#+RESULTS:
-
-** Consider some real location with tree cover
+** libraries
 #+begin_src R
   library(raster)
   library(plyr)
@@ -881,6 +692,283 @@ return(list(agreement.df, true.tree.cover.realization, pseudo.classification))
   library(rgeos)
   library(ggplot2)
   library(dplyr)
+  library(doParallel)
+library(Cairo)
+library(broom)
+#+end_src
+
+#+RESULTS:
+#+begin_example
+Loading required package: sp
+foreach: simple, scalable parallel programming from Revolution Analytics
+Use Revolution R for scalability, fault tolerance and more.
+http://www.revolutionanalytics.com
+rgeos version: 0.3-19, (SVN revision 524)
+ GEOS runtime version: 3.5.0-CAPI-1.9.0 r4084
+ Linking to sp version: 1.2-3
+ Polygon checking: TRUE
+
+Attaching package: ‘dplyr’
+
+The following objects are masked from ‘package:rgeos’:
+
+    intersect, setdiff, union
+
+The following objects are masked from ‘package:plyr’:
+
+    arrange, count, desc, failwith, id, mutate, rename, summarise,
+    summarize
+
+The following objects are masked from ‘package:raster’:
+
+    intersect, select, union
+
+The following objects are masked from ‘package:stats’:
+
+    filter, lag
+
+The following objects are masked from ‘package:base’:
+
+    intersect, setdiff, setequal, union
+Loading required package: iterators
+Loading required package: parallel
+Error in library(Cairo) : there is no package called ‘Cairo’
+#+end_example
+
+** TODO functions REWRITE FUNCTIONS
+
+
+I need to rewrite the functions to calculate the error that I would
+see from every source of error:
+- horizontal shift
+- lean
+- rasterization (1m resolution)  - this is like doing a regular sample!
+- classification
+-
+
+
+
+#+begin_src R
+     fortifyMerge = function(shapes.sp, col="id") {
+         shapes.sp@data[,col] = rownames(shapes.sp@data)
+         shapes.df = fortify(shapes.sp)
+         shapes.df = merge(shapes.df, shapes.sp@data, by=col, all.x=TRUE)
+         return(shapes.df)
+     }
+
+     make.true.tree.cover.realization <- function(stem.density,
+                                                  mean.crown.dia) {
+
+         x.min = 0
+         x.max = 100
+         y.min = 0
+         y.max = 100
+
+                                             # generate derived variables
+         region_area <- (x.max-x.min)*(y.max-y.min)
+
+                                             # generate number of stems
+         n.stems <- rpois(n = 1, lambda = region_area * stem.density)
+
+                                             # generate locations of stems
+         x <- runif(n = n.stems, min = x.min, max = x.max)
+         y <- runif(n = n.stems, min = y.min, max = y.max)
+
+                                             # make stems sp object
+         xy <- data.frame(x,y)
+         xy.sp <- SpatialPoints(xy)
+
+         diameters <- vector(length = length(xy.sp)) #vector to save diameters of trees created
+         xy.pol <- foreach(i = 1:length(xy.sp)) %do% {
+                                             # https://stat.ethz.ch/pipermail/r-help/2005-May/070678.html
+             U <- runif(1)
+             t <- -log(1- U*(1-exp(-mean.crown.dia)))
+             T1<-(mean.crown.dia - t)
+             dia <- rpois(n = 1, lambda = T1)+1
+             diameters[i] <- dia
+             pol <- gBuffer(xy.sp[i,], width = dia)
+             pol <- spChFIDs(pol, x = as.character(i))
+         }
+
+         pol <- do.call("rbind", xy.pol)
+
+         tree.sp <- gUnionCascaded(pol)
+
+         out.list <- list(tree.cover.sp = tree.sp, diameters = diameters, pt.sp = xy.sp)
+         return(out.list)
+     }
+
+     make.pseudo.classification <- function(pts,
+                                            diameters,
+                                            h_shift = T,
+                                            horizontal_shift_mean = 2,
+                                            lean = T,
+                                            interior.error.rate = .05,
+                                            additional.boundary.error.rate = .15) {
+
+         if(h_shift == T) {
+                                             # draw horizontal shift from exponential distribution with mean horizontal_shift_mean
+             lambda = 1/horizontal_shift_mean
+             d <- rexp(n = 1, rate = lambda)
+             direction.radian <- runif(n = 1, min = 0, max = 2*pi)
+             x.shift <- d * cos(direction.radian)
+             y.shift <- d * sin(direction.radian)
+
+             x <- coordinates(pts)[,1] + x.shift
+             y <- coordinates(pts)[,2] + y.shift
+
+             pts <- SpatialPoints(cbind(x,y))
+         }
+
+                                             # Assign lean based on random draw from uniform distribution to determine east/west, and distance from image center
+         if(lean == T) {
+             num <- length(pts)
+             east.west <- sample(c(1,-1), size = 1, replace = T)
+             dist.to.center <- runif(0,6000, n = 1) #width of flightline is about 12km
+
+             lean <- function(east.west, height, dist.to.center) {
+                 d = height / (9000/dist.to.center)
+                 d <- d*east.west
+                 return(d)
+             }
+
+             lean.dist <- lean(east.west, diameters, dist.to.center)
+
+             x <-  coordinates(pts)[,1] + lean.dist
+             y <- coordinates(pts)[,2]
+
+             pts <- SpatialPoints(cbind(x,y))
+         }
+
+         xy.pol <- foreach(i = 1:length(pts)) %do% {
+             pol <- gBuffer(pts[i,], width = diameters[i])
+             pol <- spChFIDs(pol, x = as.character(i))
+         }
+
+         pol <- do.call("rbind", xy.pol)
+
+         tree.sp <- gUnionCascaded(pol)
+
+                                             # rasterize polygon to NAIP imagery resolution
+         r <- raster(extent(bbox(tree.sp)),nrows = 100, ncols = 100)
+         values(r) <- 0
+
+         tree.r <- rasterize(tree.sp, r)
+
+                                             # "classify" image with overall error, and additional error at boundaries of tree cover
+         bound <- boundaries(tree.r, classes = T)
+
+         tree <- tree.r
+
+         tree[is.na(tree)] <- -1
+
+         rand <- runif(ncell(tree))
+
+         rand.raster <- raster(tree)
+         values(rand.raster) <- runif(ncell(rand.raster))
+
+         acc.raster <- raster(tree)
+         values(acc.raster) <- 1
+         acc.raster[bound == 1] <- acc.raster[bound == 1] - additional.boundary.error.rate
+         acc.raster <- acc.raster - interior.error.rate
+
+         acc.raster <- acc.raster > rand.raster
+
+         classified.tree <- overlay(tree, acc.raster, fun=function(x,y){ifelse(y==T, x*1,x*-1)})
+
+         out <- list(classified.cover = classified.tree, tree.raster = tree.r, points = pts)
+         return(out)
+     }
+
+
+   make.class.trueCover.agreement.df <- function(replicate,
+                                                 stem.density = .01,
+                                                 mean.crown.dia = 5,
+                                                 h_shift_mean = 2,
+                                                 interior.error.rate = .05,
+                                                 additional.boundary.error.rate = .15) {
+
+
+       true.tree.cover.realization <- make.true.tree.cover.realization(stem.density,
+                                                                       mean.crown.dia)
+
+   pseudo.classification <- make.pseudo.classification(true.tree.cover.realization$pt.sp,
+                                                       true.tree.cover.realization$diameters,
+                                                       h_shift = T,
+                                                       horizontal_shift_mean = h_shift_mean,
+                                                       lean = T,
+                                                       interior.error.rate,
+                                                       additional.boundary.error.rate)
+
+
+   pt <- SpatialPoints(matrix(c(50,50),nrow = 1))
+   radii <- seq(1,50,3)
+
+   circles <- lapply(radii, function(radius) as(gBuffer(pt, width = radius), "SpatialPolygonsDataFrame")) %>%
+       unlist()
+
+   pct.tree.classification <- lapply(circles, function(circle) {
+       values <- extract(pseudo.classification$classified.cover, circle) %>% unlist()
+       pct.tree.classification <- sum(values == 1)/length(values)
+       pct.tree.classification
+   }
+   ) %>%
+       unlist()
+
+  pct.tree.shifted <- lapply(circles, function(circle) {
+       values <- extract(pseudo.classification$tree.raster, circle) %>% unlist()
+       pct.tree.shifted <- sum(values == 1, na.rm = T)/length(values)
+       pct.tree.shifted
+   }
+   ) %>%
+       unlist()
+
+   pct.tree.true <- lapply(circles, function(circle) {
+       true.tree.cp <- crop(true.tree.cover.realization$tree.cover.sp, circle)
+       if(is.null(true.tree.cp)) {
+           true.tree.cp.area <- 0
+       } else {
+           true.tree.cp.area <- gArea(true.tree.cp)
+       }
+       pct.tree.true <- true.tree.cp.area/gArea(circle)
+   }) %>%
+       unlist()
+
+   agreement.df <- data.frame(pct.tree.true = pct.tree.true,
+                              pct.tree.classification = pct.tree.classification,
+                              pct.tree.shifted = pct.tree.shifted,
+                              class.and.shift.error = abs(pct.tree.true - pct.tree.classification),
+                              shift.error = abs(pct.tree.true - pct.tree.shifted),
+                              class.error = abs(pct.tree.classification - pct.tree.shifted),
+                              radius = radii,
+                              area = round(radii^2*pi),
+                              horizontal_shift_mean = h_shift_mean,
+                              interior.error.rate = interior.error.rate,
+                              additional.boundary.error.rate = additional.boundary.error.rate,
+                              replicate = replicate
+                              )
+
+   return(list(agreement.df = agreement.df, true.tree.cover.realization = true.tree.cover.realization, pseudo.classification = pseudo.classification, circles = circles))
+   }
+
+
+#+end_src
+
+#+RESULTS:
+
+** plotting pallettes
+#+begin_src R
+    utc.pal <- c("g" = "#F2AD00", "i" = "#FF0000", "t" = "#00A08A")
+    utc.col <- scale_color_manual(values = utc.pal)
+    utc.fill <- scale_fill_manual(values = utc.pal)
+    utc.theme <- list(theme(),utc.col)
+#+end_src
+
+#+RESULTS:
+
+** Consider some real location with tree cover
+
+#+begin_src R
 
   x.min = 0
   x.max = 100
@@ -1214,49 +1302,120 @@ ggplot(agreement.df, aes(x = radius, y = error)) + geom_point()
 
 ** Replicate above test many times
 code below is copied much from above.
-
 #+begin_src R
-  library(doParallel)
+      x.min = 0
+      x.max = 100
+      y.min = 0
+      y.max = 100
 
-    x.min = 0
-    x.max = 100
-    y.min = 0
-    y.max = 100
-
-    stem.density = .01 # average number of stems per unit area
-    mean.crown.dia = 5
-    h_shift_mean = 2
-    interior.error.rate = .05
-    additional.boundary.error.rate = .15
+      stem.density = .01 # average number of stems per unit area
+      mean.crown.dia = 5
+      h_shift_mean = 2
+      interior.error.rate = .05
+      additional.boundary.error.rate = .15
 
 
-  cl <- makeCluster(detectCores())
-  registerDoParallel(cl)
+    cl <- makeCluster(detectCores() - 2)
+  #  cl <- makeCluster(detectCores())
+    registerDoParallel(cl)
 
 
-  replication <- foreach(j = 1:3, .packages = c("plyr","dplyr","rgeos","sp","doParallel","foreach","raster")) %dopar% {
-      make.class.trueCover.agreement.df(replicate = j)
-  }
+    replication <- foreach(j = 1:300, .packages = c("plyr","dplyr","rgeos","sp","doParallel","foreach","raster")) %dopar% {
+        make.class.trueCover.agreement.df(replicate = j)
+    }
 
-  closeAllConnections()
+    closeAllConnections()
 
-
-  dfs <- lapply(replication, function(rep) rep[[1]])
-
-  dfs <- bind_rows(dfs)
+  saveRDS(replication, file = "../DD/replication_exact_results.rds")
 #+end_src
 
 #+RESULTS:
 
-#+begin_src R :exports results :results graphics :file ../figs/errorVSarea_TrueAndExactClass.png
-ggplot(dfs, aes(x = area, y = error, color = replicate, group = replicate)) + geom_line()
+#+begin_src R
+replication <- readRDS("../DD/replication_exact_results.rds")
+    dfs <- lapply(replication, function(rep) rep[[1]])
+
+    dfs <- bind_rows(dfs)
 #+end_src
 
 #+RESULTS:
-[[file:../figs/errorVSarea_TrueAndExactClass.png]]
+
+#+begin_src R :exports results :results graphics :file ../figs/class.and.shift.errorVSarea_TrueAndExactClass_lines.png
+ggplot(dfs, aes(x = area, y = class.and.shift.error,  group = replicate)) + geom_line(alpha = .1)
+#+end_src
+
+#+RESULTS:
+[[file:../figs/class.and.shift.errorVSarea_TrueAndExactClass_lines.png]]
+
+#+begin_src R :exports results :results graphics :file ../figs/just.shift.errorVSarea_TrueAndExactClass_lines.png
+ggplot(dfs, aes(x = area, y = shift.error,  group = replicate)) + geom_line(alpha = .1)
+#+end_src
+
+#+RESULTS:
+[[file:../figs/just.shift.errorVSarea_TrueAndExactClass_lines.png]]
+
+#+begin_src R :exports results :results graphics :file ../figs/class.to.shift.errorVSarea_TrueAndExactClass_lines.png
+ggplot(dfs, aes(x = area, y = class.error,  group = replicate)) + geom_line(alpha = .1)
+#+end_src
+
+#+RESULTS:
+[[file:../figs/class.to.shift.errorVSarea_TrueAndExactClass_lines.png]]
+
+#+begin_src R :exports results :results graphics :file ../figs/class.to.shift.errorVSarea_TrueAndExactClass.png
+ggplot(dfs, aes(x = area, y = class.error, group = area)) + geom_boxplot()
+#+end_src
+
+#+RESULTS:
+[[file:../figs/class.to.shift.errorVSarea_TrueAndExactClass.png]]
 
 
 #+begin_src R
+  library(tidyr)
+        sum.df <- dfs %>%
+          select(class.and.shift.error, class.error, shift.error,area) %>%
+          gather(key = error.type, value = error, -area) %>%
+          group_by(error.type,area) %>%
+          summarize(error_mean = mean(error),
+                    error_sd = sd(error))
+
+      sum.df
+#+end_src
+
+#+RESULTS:
+#+begin_example
+Source: local data frame [51 x 4]
+Groups: error.type [?]
+
+              error.type  area error_mean   error_sd
+                   <chr> <dbl>      <dbl>      <dbl>
+1  class.and.shift.error     3 0.20954003 0.30201641
+2  class.and.shift.error    50 0.14411123 0.14491834
+3  class.and.shift.error   154 0.10518739 0.09065990
+4  class.and.shift.error   314 0.07209668 0.06475537
+5  class.and.shift.error   531 0.05068896 0.04700505
+6  class.and.shift.error   804 0.03816162 0.03610903
+7  class.and.shift.error  1134 0.03113443 0.02591014
+8  class.and.shift.error  1521 0.02648508 0.02221413
+9  class.and.shift.error  1963 0.02366555 0.01923211
+10 class.and.shift.error  2463 0.02115712 0.01677489
+# ... with 41 more rows
+#+end_example
+
+#+begin_src R :exports results :results graphics :file ../figs/mean_sd_errors_exact.png
+limits <- aes(ymax = error_mean + error_sd, ymin=error_mean - error_sd)
+
+ggplot(sum.df, aes(x = area, y = error_mean, color = error.type)) + geom_point() + geom_pointrange(limits)
+#+end_src
+
+#+RESULTS:
+[[file:../figs/mean_sd_errors_exact.png]]
+
+
+
+
+*** Plot Replicates
+#+begin_src R :results none :eval no
+  dir.create(path = "../figs/agreement_plots_exactestimate")
 
     lapply(replication, function(rep) {
 
@@ -1271,25 +1430,55 @@ ggplot(dfs, aes(x = area, y = error, color = replicate, group = replicate)) + ge
 
         true.tree.gg <- geom_polygon(data = true.tree, aes(x = x, y = y, group = group, color = actual.cover), fill = "black",alpha = .3)
 
-        ggplot() +
-            coord_equal() +
-            class.ras.gg +
-            true.tree.gg +
-            utc.fill +
-            utc.col
+        lapply(1:length(rep$circles), function(i) {
+            circle <- rep$circles[[i]]
+            circle.fort <- fortify(circle) %>%
+                rename(x = long, y = lat)
+            circle.plot <- geom_polygon(data = circle.fort, aes(x = x, y = y, group = group), color = "black", fill = NA)
 
-  })
+            agreement <- rep$agreement.df[i,] %>%
+                mutate_all(.funs = round, digits = 3)
+
+            agreement.label.df <- data.frame(x = c(-15,-15,65,70),
+                                          y = c(102,90,102,90),
+                                          label = c(paste0("True Tree Cover: ",agreement$pct.tree.true*100,"%"),
+                                                    paste0("Map Tree Cover: ",agreement$pct.tree.classification*100,"%"),
+                                                    paste0("Error: ",agreement$error*100,"%"),
+                                                    paste0("Area: ",agreement$area)))
+
+            agreement.label <- geom_label(data = agreement.label.df, aes(x = x, y = y, label = label), size = 7, hjust = 0)
+
+            out.plot <- ggplot() +
+                coord_equal() +
+                class.ras.gg +
+                true.tree.gg +
+                circle.plot +
+                utc.fill +
+                utc.col +
+                agreement.label +
+                ggtitle(label = paste0("replicate #: ",agreement$replicate)) +
+                theme(plot.title = element_text(size = 30))
+
+            out.plot
+
+
+            ggsave(filename = sprintf("../figs/agreement_plots_exactestimate/Rep-%02s_Area-%05s.png",agreement$replicate,agreement$area),
+                   type = "cairo-png")
+                       })
+
+        })
 
 
 #+end_src
 
-#+RESULTS:
-:  Error in plot.window(...) (from #2) : need finite 'xlim' values
-: In addition: Warning messages:
-: 1: In min(x) : no non-missing arguments to min; returning Inf
-: 2: In max(x) : no non-missing arguments to max; returning -Inf
-: 3: In min(x) : no non-missing arguments to min; returning Inf
-: 4: In max(x) : no non-missing arguments to max; returning -Inf
+*** make gif
+
+#+BEGIN_SRC sh
+  convert -delay 100 ../figs/agreement_plots_exactestimate/*.png -loop 0 ../figs/agreement_plots_exactestimate/AgreementExact.gif
+#+END_SRC
+
+#+RESULTS[22634961e7ff0fe77df32d27487dea458c05403f]:
+: convert -delay 100
 
 ** Create Accuracy Assessment points
 
